@@ -1,0 +1,307 @@
+#!/bin/bash
+# PC_Info для macOS — собирает характеристики компьютера и открывает HTML-отчёт.
+
+set -o pipefail
+
+LOG="/tmp/pc_info_error.log"
+: > "$LOG"
+
+fail_alert() {
+    osascript -e "display alert \"Ошибка сбора данных\" message \"$1\"" >/dev/null 2>&1
+}
+
+# ---------- Вспомогательные функции ----------
+
+row() {
+    local label="$1" value="$2"
+    if [ -z "$value" ]; then value="н/д"; fi
+    printf "<div class='row'><span class='l'>%s</span><span class='v'>%s</span></div>" "$label" "$value"
+}
+
+hw_get() {
+    # Извлекает значение поля "Label: value" из блока system_profiler
+    echo "$1" | awk -F': ' -v key="$2" '
+        { line=$0; sub(/^[ \t]+/, "", line);
+          if (index(line, key": ")==1) { sub("^"key": ", "", line); print line; exit } }'
+}
+
+bytes_to_human() {
+    local bytes="$1"
+    if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then echo "н/д"; return; fi
+    awk -v b="$bytes" 'BEGIN {
+        gb = b/1024/1024/1024;
+        tb = gb/1024;
+        if (tb >= 1) printf "%.2f ТБ", tb;
+        else if (gb >= 1) printf "%.2f ГБ", gb;
+        else printf "%.0f МБ", b/1024/1024;
+    }'
+}
+
+# ---------- Сбор данных ----------
+
+HW_INFO="$(system_profiler SPHardwareDataType 2>>"$LOG")"
+OS_NAME="$(sw_vers -productName 2>>"$LOG")"
+OS_VER="$(sw_vers -productVersion 2>>"$LOG")"
+OS_BUILD="$(sw_vers -buildVersion 2>>"$LOG")"
+HOSTNAME="$(scutil --get ComputerName 2>>"$LOG")"
+ARCH="$(uname -m 2>>"$LOG")"
+
+MODEL_NAME="$(hw_get "$HW_INFO" "Model Name")"
+MODEL_ID="$(hw_get "$HW_INFO" "Model Identifier")"
+CHIP="$(hw_get "$HW_INFO" "Chip")"
+[ -z "$CHIP" ] && CHIP="$(hw_get "$HW_INFO" "Processor Name")"
+CORES="$(hw_get "$HW_INFO" "Total Number of Cores")"
+MEM_TOTAL_STR="$(hw_get "$HW_INFO" "Memory")"
+SERIAL="$(hw_get "$HW_INFO" "Serial Number (system)")"
+FIRMWARE="$(hw_get "$HW_INFO" "System Firmware Version")"
+
+IS_LAPTOP=0
+case "$MODEL_NAME" in
+    *MacBook*) IS_LAPTOP=1 ;;
+esac
+
+# --- Система ---
+SYS_ROWS=""
+SYS_ROWS+="$(row "Компьютер" "$HOSTNAME")"
+SYS_ROWS+="$(row "ОС" "$OS_NAME $OS_VER")"
+SYS_ROWS+="$(row "Сборка" "$OS_BUILD ($ARCH)")"
+SYS_ROWS+="$(row "Модель" "$MODEL_NAME")"
+SYS_ROWS+="$(row "Идентификатор модели" "$MODEL_ID")"
+SYS_ROWS+="$(row "Тип" "$([ $IS_LAPTOP -eq 1 ] && echo 'Ноутбук' || echo 'Стационарный Mac')")"
+
+# --- Процессор ---
+CPU_ROWS=""
+CPU_ROWS+="$(row "Чип/процессор" "$CHIP")"
+CPU_ROWS+="$(row "Ядра" "$CORES")"
+BRAND="$(sysctl -n machdep.cpu.brand_string 2>>"$LOG")"
+[ -n "$BRAND" ] && CPU_ROWS+="$(row "Модель (детально)" "$BRAND")"
+PCORES="$(sysctl -n hw.physicalcpu 2>>"$LOG")"
+LCORES="$(sysctl -n hw.logicalcpu 2>>"$LOG")"
+CPU_ROWS+="$(row "Физ./логич. ядра" "$PCORES / $LCORES")"
+
+# --- Плата / прошивка ---
+BOARD_ROWS=""
+BOARD_ROWS+="$(row "Серийный номер" "$SERIAL")"
+BOARD_ROWS+="$(row "Версия прошивки" "$FIRMWARE")"
+
+# --- Видеокарты и дисплеи ---
+GFX_INFO="$(system_profiler SPDisplaysDataType 2>>"$LOG")"
+GPU_ROWS=""
+while IFS= read -r line; do
+    trimmed="$(echo "$line" | sed 's/^[ \t]*//')"
+    if [[ "$trimmed" == "Chipset Model: "* ]]; then
+        GPU_ROWS+="<div class='item'>"
+        GPU_ROWS+="$(row "Модель" "${trimmed#Chipset Model: }")"
+    elif [[ "$trimmed" == "VRAM"*": "* ]]; then
+        val="$(echo "$trimmed" | sed 's/^[^:]*: //')"
+        GPU_ROWS+="$(row "Видеопамять" "$val")"
+    elif [[ "$trimmed" == "Total Number of Cores: "* ]]; then
+        GPU_ROWS+="$(row "Ядра GPU" "${trimmed#Total Number of Cores: }")"
+        GPU_ROWS+="</div>"
+    fi
+done <<< "$GFX_INFO"
+[ -z "$GPU_ROWS" ] && GPU_ROWS="$(row "Модель" "н/д")"
+
+MON_ROWS=""
+while IFS= read -r line; do
+    trimmed="$(echo "$line" | sed 's/^[ \t]*//')"
+    if [[ "$trimmed" == "Resolution: "* ]]; then
+        MON_ROWS+="$(row "Разрешение" "${trimmed#Resolution: }")"
+    fi
+done <<< "$GFX_INFO"
+[ -z "$MON_ROWS" ] && MON_ROWS="$(row "Разрешение" "н/д")"
+
+# --- Оперативная память ---
+RAM_ROWS="$(row "Всего" "$MEM_TOTAL_STR")"
+MEM_INFO="$(system_profiler SPMemoryDataType 2>>"$LOG")"
+if echo "$MEM_INFO" | grep -q "BANK"; then
+    while IFS= read -r line; do
+        trimmed="$(echo "$line" | sed 's/^[ \t]*//')"
+        if [[ "$trimmed" == BANK*: ]]; then
+            RAM_ROWS+="<div class='item'>"
+            RAM_ROWS+="$(row "Слот" "${trimmed%:}")"
+        elif [[ "$trimmed" == "Size: "* ]]; then
+            RAM_ROWS+="$(row "Объём" "${trimmed#Size: }")"
+        elif [[ "$trimmed" == "Speed: "* ]]; then
+            RAM_ROWS+="$(row "Частота" "${trimmed#Speed: }")"
+        elif [[ "$trimmed" == "Type: "* ]]; then
+            RAM_ROWS+="$(row "Тип" "${trimmed#Type: }")$(printf '</div>')"
+        fi
+    done <<< "$MEM_INFO"
+else
+    RAM_ROWS+="<div class='item'>$(row "Тип" "Распаяна (Unified Memory), слотов нет")</div>"
+fi
+
+# --- Диски ---
+DISK_ROWS=""
+DF_OUT="$(df -H 2>>"$LOG" | grep -E '^/dev/disk' | grep -v '/System/Volumes/VM\|/System/Volumes/Preboot\|/System/Volumes/Update')"
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    dev="$(echo "$line" | awk '{print $1}')"
+    size="$(echo "$line" | awk '{print $2}')"
+    used="$(echo "$line" | awk '{print $3}')"
+    avail="$(echo "$line" | awk '{print $4}')"
+    mount="$(echo "$line" | awk '{for(i=9;i<=NF;i++) printf $i" "; print ""}' | sed 's/ $//')"
+    DISK_ROWS+="<div class='item'>"
+    DISK_ROWS+="$(row "$mount" "$avail своб. из $size")"
+    DISK_ROWS+="</div>"
+done <<< "$DF_OUT"
+[ -z "$DISK_ROWS" ] && DISK_ROWS="$(row "Диски" "н/д")"
+
+# --- Сеть ---
+NET_ROWS=""
+while IFS= read -r line; do
+    port="$(echo "$line" | sed -n 's/^Hardware Port: //p')"
+    dev="$(echo "$line" | sed -n 's/^Device: //p')"
+    if [ -n "$port" ]; then LAST_PORT="$port"; fi
+    if [ -n "$dev" ]; then
+        mac="$(ifconfig "$dev" 2>>"$LOG" | awk '/ether/{print $2}')"
+        if [ -n "$mac" ]; then
+            NET_ROWS+="<div class='item'>"
+            NET_ROWS+="$(row "$LAST_PORT" "$dev")"
+            NET_ROWS+="$(row "MAC" "$mac")"
+            NET_ROWS+="</div>"
+        fi
+    fi
+done <<< "$(networksetup -listallhardwareports 2>>"$LOG")"
+[ -z "$NET_ROWS" ] && NET_ROWS="$(row "Адаптеры" "н/д")"
+
+# --- Батарея ---
+BATT_ROWS=""
+if [ $IS_LAPTOP -eq 1 ]; then
+    BATT_RAW="$(pmset -g batt 2>>"$LOG")"
+    PCT="$(echo "$BATT_RAW" | grep -Eo '[0-9]+%' | head -1)"
+    STATE="$(echo "$BATT_RAW" | grep -Eo 'charging|discharging|charged' | head -1)"
+    case "$STATE" in
+        charging) STATE_RU="Заряжается" ;;
+        discharging) STATE_RU="Разряжается" ;;
+        charged) STATE_RU="Заряжена полностью" ;;
+        *) STATE_RU="Неизвестно" ;;
+    esac
+    BATT_ROWS+="$(row "Заряд" "$PCT")"
+    BATT_ROWS+="$(row "Статус" "$STATE_RU")"
+    POWER_INFO="$(system_profiler SPPowerDataType 2>>"$LOG")"
+    CYCLES="$(hw_get "$POWER_INFO" "Cycle Count")"
+    COND="$(hw_get "$POWER_INFO" "Condition")"
+    [ -n "$CYCLES" ] && BATT_ROWS+="$(row "Циклов перезарядки" "$CYCLES")"
+    [ -n "$COND" ] && BATT_ROWS+="$(row "Состояние" "$COND")"
+else
+    BATT_ROWS="$(row "Батарея" "Не обнаружена (стационарный Mac)")"
+fi
+
+# --- Питание ---
+POWER_ROWS=""
+if [ $IS_LAPTOP -eq 1 ]; then
+    POWER_INFO="${POWER_INFO:-$(system_profiler SPPowerDataType 2>>"$LOG")}"
+    WATTAGE="$(hw_get "$POWER_INFO" "Wattage (W)")"
+    CONNECTED="$(hw_get "$POWER_INFO" "Connected")"
+    [ -n "$WATTAGE" ] && POWER_ROWS+="$(row "Мощность адаптера" "${WATTAGE} Вт")"
+    [ -n "$CONNECTED" ] && POWER_ROWS+="$(row "Адаптер подключен" "$CONNECTED")"
+    [ -z "$WATTAGE" ] && POWER_ROWS+="$(row "Адаптер" "Не подключен / нет данных")"
+else
+    POWER_ROWS="$(row "Источник" "От сети (стационарный Mac)")"
+fi
+
+# --- Температура ---
+TEMP_ROWS="$(row "Статус" "Недоступно без сторонних утилит (например, iStat Menus) — macOS не даёт температуру через стандартные команды")"
+
+DATE_NOW="$(date '+%d.%m.%Y %H:%M')"
+
+# ---------- Генерация HTML ----------
+
+OUT="/tmp/PC_Info_Report_$$.html"
+
+cat > "$OUT" << HTMLEOF
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Характеристики компьютера</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    font-family: -apple-system, 'Segoe UI', Inter, Arial, sans-serif;
+    background: #0b0b10;
+    margin: 0; padding: 14px;
+    color: #e7e7ec;
+    font-size: 12px;
+    position: relative;
+    overflow-x: hidden;
+  }
+  body::before, body::after, .glow3 {
+    content: '';
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(90px);
+    opacity: 0.35;
+    z-index: 0;
+    pointer-events: none;
+  }
+  body::before { width: 260px; height: 260px; background: #22c55e; top: -60px; left: -60px; }
+  body::after { width: 260px; height: 260px; background: #eab308; bottom: -60px; right: 10%; }
+  .glow3 { width: 240px; height: 240px; background: #3b82f6; top: 40%; right: -60px; position: fixed; }
+
+  .topbar { position: relative; z-index: 1; display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 2px; }
+  .badge {
+    display: flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 7px;
+    background: linear-gradient(135deg,#6366f1,#22d3ee);
+    font-size: 13px;
+  }
+  h1 { text-align: center; color: #f5f5f7; margin: 4px 0 2px 0; font-size: 19px; font-weight: 700; position: relative; z-index: 1; letter-spacing: -0.2px; }
+  .subtitle { text-align: center; color: #8b8b96; margin-bottom: 12px; font-size: 11px; position: relative; z-index: 1; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 9px; max-width: 1500px; margin: 0 auto; position: relative; z-index: 1; }
+  .section {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    padding: 10px 12px;
+    backdrop-filter: blur(6px);
+  }
+  .section h2 {
+    margin: 0 0 6px 0;
+    color: #a5b4fc;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .row { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; line-height: 1.4; }
+  .row .l { color: #8b8b96; font-weight: 500; white-space: nowrap; }
+  .row .v { text-align: right; word-break: break-word; color: #f0f0f3; font-weight: 500; }
+  .item { padding: 4px 0; border-top: 1px dashed rgba(255,255,255,0.08); }
+  .item:first-of-type { border-top: none; }
+  .footer { text-align: center; color: #55555f; font-size: 10.5px; margin-top: 12px; position: relative; z-index: 1; }
+  .footer .signature { color: #8b8b96; margin-top: 3px; font-weight: 600; letter-spacing: 0.2px; }
+</style>
+</head>
+<body>
+<div class="glow3"></div>
+<div class="topbar"><div class="badge">🖥️</div></div>
+<h1>Характеристики компьютера</h1>
+<div class="subtitle">Отчёт сформирован: $DATE_NOW</div>
+
+<div class="grid">
+  <div class="section"><h2>Система</h2>$SYS_ROWS</div>
+  <div class="section"><h2>Процессор</h2>$CPU_ROWS</div>
+  <div class="section"><h2>Серийный номер / прошивка</h2>$BOARD_ROWS</div>
+  <div class="section"><h2>Видеокарта(ы)</h2>$GPU_ROWS</div>
+  <div class="section"><h2>Оперативная память</h2>$RAM_ROWS</div>
+  <div class="section"><h2>Диски</h2>$DISK_ROWS</div>
+  <div class="section"><h2>Монитор</h2>$MON_ROWS</div>
+  <div class="section"><h2>Сеть</h2>$NET_ROWS</div>
+  <div class="section"><h2>Температура</h2>$TEMP_ROWS</div>
+  <div class="section"><h2>Батарея</h2>$BATT_ROWS</div>
+  <div class="section"><h2>Питание</h2>$POWER_ROWS</div>
+</div>
+
+<div class="footer">
+  Сгенерировано автоматически
+  <div class="signature">Made by @Sayakbaev</div>
+</div>
+</body>
+</html>
+HTMLEOF
+
+open "$OUT"
